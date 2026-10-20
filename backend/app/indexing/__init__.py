@@ -1,0 +1,1 @@
+﻿"""Derived Pinecone index maintenance."""

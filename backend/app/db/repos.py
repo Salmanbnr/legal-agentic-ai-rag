@@ -1,0 +1,590 @@
+"""Typed repositories for case data with explicit ownership checks.
+
+Every function receives the authenticated user id from the API layer. Reads,
+updates, and child-record inserts verify that the case belongs to that user in
+backend code, even though the service-role client bypasses RLS.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Literal
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field
+from supabase import Client
+
+CaseStatus = Literal["active", "archived"]
+QualityStatus = Literal[
+    "pending",
+    "ready",
+    "ready_with_warnings",
+    "needs_review",
+    "failed",
+    "password_required",
+]
+ProcessingStatus = Literal[
+    "uploaded",
+    "validating",
+    "extracting",
+    "ocr",
+    "chunking",
+    "embedding",
+    "indexing",
+    "ready",
+    "needs_review",
+    "failed",
+]
+IndexStatus = Literal["pending", "indexed", "failed", "stale"]
+ExtractionMethod = Literal["native", "ocr", "none"]
+JobType = Literal["ingest", "reindex", "delete"]
+JobStatus = Literal["queued", "running", "succeeded", "failed"]
+
+
+class RepositoryError(RuntimeError):
+    """Base class for repository failures."""
+
+
+class CaseAccessDenied(RepositoryError):
+    """Raised when a case is missing or owned by another user."""
+
+
+class DocumentAccessDenied(RepositoryError):
+    """Raised when a document is missing or not owned by the user's case."""
+
+
+class RecordNotFound(RepositoryError):
+    """Raised when a record required for an operation does not exist."""
+
+
+class RowModel(BaseModel):
+    """Base model for database rows, tolerant of extra generated columns."""
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class Case(RowModel):
+    """A legal case owned by one authenticated user."""
+
+    id: UUID
+    owner_user_id: UUID
+    title: str
+    description: str | None = None
+    status: CaseStatus
+    created_at: datetime
+    updated_at: datetime
+
+
+class Document(RowModel):
+    """An uploaded original document and its processing metadata."""
+
+    id: UUID
+    case_id: UUID
+    owner_user_id: UUID
+    storage_path: str
+    original_filename: str
+    detected_mime: str | None = None
+    sha256: str | None = None
+    size_bytes: int | None = None
+    page_count: int | None = None
+    document_type: str | None = None
+    version_group_id: UUID | None = None
+    duplicate_of: UUID | None = None
+    quality_status: QualityStatus
+    quality_report: dict[str, Any] = Field(default_factory=dict)
+    processing_status: ProcessingStatus
+    parser_version: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class DocumentPage(RowModel):
+    """One extracted page with provenance and transformation metadata."""
+
+    id: UUID
+    case_id: UUID
+    document_id: UUID
+    page_number: int
+    extraction_method: ExtractionMethod
+    text_density: float | None = None
+    ocr_confidence: float | None = None
+    raw_text: str | None = None
+    clean_text: str | None = None
+    quality_flags: list[Any] = Field(default_factory=list)
+    transform_log: list[Any] = Field(default_factory=list)
+    created_at: datetime
+
+
+class DocumentChunk(RowModel):
+    """A citation-ready chunk of text derived from a document page range."""
+
+    id: UUID
+    case_id: UUID
+    document_id: UUID
+    document_version_id: UUID | None = None
+    chunk_index: int
+    page_start: int | None = None
+    page_end: int | None = None
+    section_path: list[str] = Field(default_factory=list)
+    text_content: str
+    content_hash: str
+    source_anchor: str | None = None
+    embedding_model: str | None = None
+    index_schema_version: int
+    index_status: IndexStatus
+    quality_flags: list[Any] = Field(default_factory=list)
+    created_at: datetime
+
+
+class ProcessingJob(RowModel):
+    """An idempotent ingestion, reindex, or delete job."""
+
+    id: UUID
+    case_id: UUID
+    document_id: UUID
+    job_type: JobType
+    idempotency_key: str
+    status: JobStatus
+    attempts: int
+    error_code: str | None = None
+    error_summary: str | None = None
+    pipeline_version: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    created_at: datetime
+
+
+class AuditEvent(RowModel):
+    """A safe, append-only audit record."""
+
+    id: UUID
+    case_id: UUID | None = None
+    actor_user_id: UUID | None = None
+    event_type: str
+    target_type: str | None = None
+    target_id: str | None = None
+    request_id: str | None = None
+    safe_metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class DocumentCreate(BaseModel):
+    """Fields accepted when registering an uploaded document."""
+
+    storage_path: str = Field(min_length=1)
+    original_filename: str = Field(min_length=1)
+    detected_mime: str | None = None
+    sha256: str | None = None
+    size_bytes: int | None = Field(default=None, ge=0)
+    page_count: int | None = Field(default=None, ge=0)
+    document_type: str | None = None
+    version_group_id: UUID | None = None
+    duplicate_of: UUID | None = None
+
+
+class DocumentUpdate(BaseModel):
+    """Mutable document metadata and processing fields."""
+
+    detected_mime: str | None = None
+    sha256: str | None = None
+    size_bytes: int | None = Field(default=None, ge=0)
+    page_count: int | None = Field(default=None, ge=0)
+    document_type: str | None = None
+    version_group_id: UUID | None = None
+    duplicate_of: UUID | None = None
+    quality_status: QualityStatus | None = None
+    quality_report: dict[str, Any] | None = None
+    processing_status: ProcessingStatus | None = None
+    parser_version: str | None = None
+
+
+class PageCreate(BaseModel):
+    """Fields accepted for one extracted page."""
+
+    page_number: int = Field(ge=1)
+    extraction_method: ExtractionMethod
+    text_density: float | None = Field(default=None, ge=0)
+    ocr_confidence: float | None = Field(default=None, ge=0)
+    raw_text: str | None = None
+    clean_text: str | None = None
+    quality_flags: list[Any] = Field(default_factory=list)
+    transform_log: list[Any] = Field(default_factory=list)
+
+
+class ChunkCreate(BaseModel):
+    """Fields accepted for one citation-ready chunk."""
+
+    chunk_index: int = Field(ge=0)
+    page_start: int | None = Field(default=None, ge=1)
+    page_end: int | None = Field(default=None, ge=1)
+    section_path: list[str] = Field(default_factory=list)
+    text_content: str = Field(min_length=1)
+    content_hash: str = Field(min_length=1)
+    source_anchor: str | None = None
+    embedding_model: str | None = None
+    index_schema_version: int = Field(default=1, ge=1)
+    index_status: IndexStatus = "pending"
+    quality_flags: list[Any] = Field(default_factory=list)
+
+
+class JobCreate(BaseModel):
+    """Fields accepted when enqueueing a processing job."""
+
+    job_type: JobType
+    idempotency_key: str = Field(min_length=1)
+    pipeline_version: str | None = None
+
+
+class JobUpdate(BaseModel):
+    """Mutable job state and sanitized failure metadata."""
+
+    status: JobStatus | None = None
+    attempts: int | None = Field(default=None, ge=0)
+    error_code: str | None = None
+    error_summary: str | None = None
+    pipeline_version: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+def _rows(response: Any) -> list[dict[str, Any]]:
+    """Normalize a Supabase response payload into a list of rows."""
+    data = getattr(response, "data", None)
+    if data is None:
+        return []
+    if isinstance(data, dict):
+        return [data]
+    return [row for row in data if isinstance(row, dict)]
+
+
+def _first_row(response: Any) -> dict[str, Any] | None:
+    """Return the first row from a Supabase response, if any."""
+    rows = _rows(response)
+    return rows[0] if rows else None
+
+
+def _as_text(value: UUID | str) -> str:
+    """Canonicalize a UUID-like value for PostgREST filters and payloads."""
+    try:
+        return str(UUID(str(value)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid UUID value") from exc
+
+
+def _pagination(limit: int, offset: int) -> tuple[int, int]:
+    """Validate and convert limit/offset into an inclusive PostgREST range."""
+    if not 1 <= limit <= 200:
+        raise ValueError("limit must be between 1 and 200")
+    if offset < 0:
+        raise ValueError("offset must be non-negative")
+    return offset, offset + limit - 1
+
+
+def _require_case_row(
+    client: Client, user_id: UUID | str, case_id: UUID | str
+) -> dict[str, Any]:
+    """Load a case and reject it unless the user explicitly owns it."""
+    response = (
+        client.table("cases")
+        .select("*")
+        .eq("id", _as_text(case_id))
+        .limit(1)
+        .execute()
+    )
+    row = _first_row(response)
+    owner_id = row.get("owner_user_id") if row is not None else None
+    if owner_id is None or _as_text(owner_id) != _as_text(user_id):
+        raise CaseAccessDenied("Case not found or access denied")
+    return row
+
+
+def _require_document_row(
+    client: Client,
+    user_id: UUID | str,
+    document_id: UUID | str,
+    case_id: UUID | str | None = None,
+) -> dict[str, Any]:
+    """Load a document and verify its owner and case ownership."""
+    response = (
+        client.table("documents")
+        .select("*")
+        .eq("id", _as_text(document_id))
+        .limit(1)
+        .execute()
+    )
+    row = _first_row(response)
+    owner_id = row.get("owner_user_id") if row is not None else None
+    if owner_id is None or _as_text(owner_id) != _as_text(user_id):
+        raise DocumentAccessDenied("Document not found or access denied")
+    if case_id is not None and _as_text(row.get("case_id")) != _as_text(case_id):
+        raise DocumentAccessDenied("Document not found or access denied")
+    _require_case_row(client, user_id, row["case_id"])
+    return row
+
+
+def _require_job_row(
+    client: Client, user_id: UUID | str, job_id: UUID | str
+) -> dict[str, Any]:
+    """Load a job and verify the user owns its case."""
+    response = (
+        client.table("processing_jobs")
+        .select("*")
+        .eq("id", _as_text(job_id))
+        .limit(1)
+        .execute()
+    )
+    row = _first_row(response)
+    if row is None:
+        raise RecordNotFound("Job not found or access denied")
+    _require_case_row(client, user_id, row["case_id"])
+    return row
+
+
+def _inserted_row(response: Any, label: str) -> dict[str, Any]:
+    """Require an inserted row so callers never receive a silent no-op."""
+    row = _first_row(response)
+    if row is None:
+        raise RepositoryError(f"{label} insert returned no row")
+    return row
+
+
+def create_case(
+    client: Client,
+    user_id: UUID | str,
+    *,
+    title: str,
+    description: str | None = None,
+    status: CaseStatus = "active",
+) -> Case:
+    """Create a case owned by the authenticated user."""
+    clean_title = title.strip()
+    if not clean_title:
+        raise ValueError("Case title must not be empty")
+    response = (
+        client.table("cases")
+        .insert(
+            {
+                "owner_user_id": _as_text(user_id),
+                "title": clean_title,
+                "description": description,
+                "status": status,
+            }
+        )
+        .execute()
+    )
+    return Case.model_validate(_inserted_row(response, "Case"))
+
+
+def get_case_for_user(
+    client: Client, user_id: UUID | str, case_id: UUID | str
+) -> Case:
+    """Return a case only when it is owned by the authenticated user.
+
+    Raises:
+        CaseAccessDenied: If the case is missing or owned by another user.
+    """
+    return Case.model_validate(_require_case_row(client, user_id, case_id))
+
+
+def list_cases(
+    client: Client,
+    user_id: UUID | str,
+    *,
+    status: CaseStatus | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[Case]:
+    """List only the authenticated user's cases."""
+    start, end = _pagination(limit, offset)
+    query = client.table("cases").select("*").eq(
+        "owner_user_id", _as_text(user_id)
+    )
+    if status is not None:
+        query = query.eq("status", status)
+    response = query.order("updated_at", desc=True).range(start, end).execute()
+    return [Case.model_validate(row) for row in _rows(response)]
+
+
+def create_document(
+    client: Client,
+    user_id: UUID | str,
+    case_id: UUID | str,
+    data: DocumentCreate,
+) -> Document:
+    """Register a document after verifying the user owns the case."""
+    _require_case_row(client, user_id, case_id)
+    payload = {
+        "case_id": _as_text(case_id),
+        "owner_user_id": _as_text(user_id),
+        **data.model_dump(mode="json", exclude_none=True),
+    }
+    response = client.table("documents").insert(payload).execute()
+    return Document.model_validate(_inserted_row(response, "Document"))
+
+
+def update_document(
+    client: Client,
+    user_id: UUID | str,
+    document_id: UUID | str,
+    update: DocumentUpdate,
+) -> Document:
+    """Update document metadata after verifying document and case ownership."""
+    document = _require_document_row(client, user_id, document_id)
+    payload = update.model_dump(mode="json", exclude_unset=True)
+    if not payload:
+        raise ValueError("Document update must include at least one field")
+    response = (
+        client.table("documents")
+        .update(payload)
+        .eq("id", _as_text(document_id))
+        .eq("owner_user_id", _as_text(user_id))
+        .eq("case_id", _as_text(document["case_id"]))
+        .execute()
+    )
+    return Document.model_validate(_inserted_row(response, "Document"))
+
+
+def list_documents(
+    client: Client,
+    user_id: UUID | str,
+    case_id: UUID | str,
+    *,
+    processing_status: ProcessingStatus | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[Document]:
+    """List documents for a case after verifying case ownership."""
+    _require_case_row(client, user_id, case_id)
+    start, end = _pagination(limit, offset)
+    query = (
+        client.table("documents")
+        .select("*")
+        .eq("case_id", _as_text(case_id))
+        .eq("owner_user_id", _as_text(user_id))
+    )
+    if processing_status is not None:
+        query = query.eq("processing_status", processing_status)
+    response = query.order("created_at", desc=True).range(start, end).execute()
+    return [Document.model_validate(row) for row in _rows(response)]
+
+
+def insert_pages(
+    client: Client,
+    user_id: UUID | str,
+    case_id: UUID | str,
+    document_id: UUID | str,
+    pages: list[PageCreate],
+) -> list[DocumentPage]:
+    """Insert extracted pages after verifying document and case ownership."""
+    if not pages:
+        return []
+    _require_document_row(client, user_id, document_id, case_id)
+    payload = [
+        {
+            "case_id": _as_text(case_id),
+            "document_id": _as_text(document_id),
+            **page.model_dump(mode="json", exclude_none=True),
+        }
+        for page in pages
+    ]
+    response = client.table("document_pages").insert(payload).execute()
+    rows = _rows(response)
+    if len(rows) != len(payload):
+        raise RepositoryError("Document page insert returned an unexpected row count")
+    return [DocumentPage.model_validate(row) for row in rows]
+
+
+def insert_chunks(
+    client: Client,
+    user_id: UUID | str,
+    case_id: UUID | str,
+    document_id: UUID | str,
+    chunks: list[ChunkCreate],
+) -> list[DocumentChunk]:
+    """Insert citation-ready chunks after verifying ownership."""
+    if not chunks:
+        return []
+    _require_document_row(client, user_id, document_id, case_id)
+    payload = [
+        {
+            "case_id": _as_text(case_id),
+            "document_id": _as_text(document_id),
+            **chunk.model_dump(mode="json", exclude_none=True),
+        }
+        for chunk in chunks
+    ]
+    response = client.table("document_chunks").insert(payload).execute()
+    rows = _rows(response)
+    if len(rows) != len(payload):
+        raise RepositoryError("Document chunk insert returned an unexpected row count")
+    return [DocumentChunk.model_validate(row) for row in rows]
+
+
+def create_job(
+    client: Client,
+    user_id: UUID | str,
+    case_id: UUID | str,
+    document_id: UUID | str,
+    data: JobCreate,
+) -> ProcessingJob:
+    """Create an idempotent processing job after verifying ownership."""
+    _require_document_row(client, user_id, document_id, case_id)
+    payload = {
+        "case_id": _as_text(case_id),
+        "document_id": _as_text(document_id),
+        **data.model_dump(mode="json", exclude_none=True),
+    }
+    response = client.table("processing_jobs").insert(payload).execute()
+    return ProcessingJob.model_validate(_inserted_row(response, "Job"))
+
+
+def update_job(
+    client: Client,
+    user_id: UUID | str,
+    job_id: UUID | str,
+    update: JobUpdate,
+) -> ProcessingJob:
+    """Update job state after verifying the user owns the job's case."""
+    job = _require_job_row(client, user_id, job_id)
+    payload = update.model_dump(mode="json", exclude_unset=True)
+    if not payload:
+        raise ValueError("Job update must include at least one field")
+    response = (
+        client.table("processing_jobs")
+        .update(payload)
+        .eq("id", _as_text(job_id))
+        .eq("case_id", _as_text(job["case_id"]))
+        .execute()
+    )
+    return ProcessingJob.model_validate(_inserted_row(response, "Job"))
+
+
+def write_audit_event(
+    client: Client,
+    user_id: UUID | str,
+    *,
+    event_type: str,
+    case_id: UUID | str | None = None,
+    target_type: str | None = None,
+    target_id: str | None = None,
+    request_id: str | None = None,
+    safe_metadata: dict[str, Any] | None = None,
+) -> AuditEvent:
+    """Append a safe audit event, verifying case ownership when linked.
+
+    `safe_metadata` must never contain document text, prompts, completions,
+    credentials, or tokens.
+    """
+    if case_id is not None:
+        _require_case_row(client, user_id, case_id)
+    payload = {
+        "case_id": _as_text(case_id) if case_id is not None else None,
+        "actor_user_id": _as_text(user_id),
+        "event_type": event_type,
+        "target_type": target_type,
+        "target_id": target_id,
+        "request_id": request_id,
+        "safe_metadata": dict(safe_metadata or {}),
+    }
+    response = client.table("audit_events").insert(payload).execute()
+    return AuditEvent.model_validate(_inserted_row(response, "Audit event"))

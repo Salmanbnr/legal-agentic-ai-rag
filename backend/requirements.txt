@@ -1,0 +1,31 @@
+# Runtime dependencies are pinned for reproducible installs.
+# System requirement: Tesseract OCR must be installed separately (see Dockerfile).
+
+fastapi==0.115.6
+uvicorn==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.0
+httpx==0.28.1
+supabase==2.11.0
+PyJWT==2.10.1
+python-multipart==0.0.20
+
+# Document processing
+PyMuPDF==1.25.1
+pytesseract==0.3.13
+opencv-python-headless==4.10.0.84
+Pillow==11.0.0
+
+# Embeddings and vector index
+sentence-transformers==3.3.1
+pinecone==5.0.1
+
+# Orchestration and LLM access
+langchain==0.3.13
+langgraph==0.2.60
+langchain-openai==0.2.14
+openai==1.58.1
+
+# Tests
+pytest==8.3.4
+pytest-asyncio==0.25.0
