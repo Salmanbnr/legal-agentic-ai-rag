@@ -26,3 +26,8 @@ def get_service_client(settings: Settings | None = None) -> Client:
         resolved.supabase_url_value,
         resolved.supabase_service_role_key.get_secret_value(),
     )
+
+
+def get_db_client() -> Client:
+    """FastAPI dependency that supplies the server-side service client."""
+    return get_service_client()

@@ -75,6 +75,14 @@ class Case(RowModel):
     updated_at: datetime
 
 
+class CaseUpdate(BaseModel):
+    """Mutable case fields accepted by the repository."""
+
+    title: str | None = None
+    description: str | None = None
+    status: CaseStatus | None = None
+
+
 class Document(RowModel):
     """An uploaded original document and its processing metadata."""
 
@@ -405,6 +413,34 @@ def list_cases(
     return [Case.model_validate(row) for row in _rows(response)]
 
 
+def update_case(
+    client: Client,
+    user_id: UUID | str,
+    case_id: UUID | str,
+    update: CaseUpdate,
+) -> Case:
+    """Update a case after verifying the authenticated user owns it."""
+    _require_case_row(client, user_id, case_id)
+    payload = update.model_dump(mode="json", exclude_unset=True)
+    if not payload:
+        raise ValueError("Case update must include at least one field")
+    if "title" in payload:
+        title = payload["title"]
+        if title is None or not str(title).strip():
+            raise ValueError("Case title must not be empty")
+        payload["title"] = str(title).strip()
+    if "status" in payload and payload["status"] is None:
+        raise ValueError("Case status must not be null")
+    response = (
+        client.table("cases")
+        .update(payload)
+        .eq("id", _as_text(case_id))
+        .eq("owner_user_id", _as_text(user_id))
+        .execute()
+    )
+    return Case.model_validate(_inserted_row(response, "Case"))
+
+
 def create_document(
     client: Client,
     user_id: UUID | str,
@@ -420,6 +456,18 @@ def create_document(
     }
     response = client.table("documents").insert(payload).execute()
     return Document.model_validate(_inserted_row(response, "Document"))
+
+
+def get_document_for_user(
+    client: Client, user_id: UUID | str, document_id: UUID | str
+) -> Document:
+    """Return a document only when the user owns its case.
+
+    Raises:
+        DocumentAccessDenied: If the document is missing or not owned by the
+            authenticated user's case.
+    """
+    return Document.model_validate(_require_document_row(client, user_id, document_id))
 
 
 def update_document(

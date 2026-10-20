@@ -55,7 +55,9 @@ curl http://localhost:8000/health
 ```
 
 Expected response: `{"status":"ok","service":"legal-ai-backend","version":"0.1.0"}`.
-Interactive API docs are available at `/docs` outside production.
+Interactive API docs are available at `/docs` outside production. See
+`docs/DEV.md` for acquiring a Supabase access token and calling the case API with
+curl.
 
 Run tests:
 

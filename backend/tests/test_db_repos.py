@@ -10,17 +10,20 @@ import pytest
 
 from app.db.repos import (
     CaseAccessDenied,
+    CaseUpdate,
     ChunkCreate,
     DocumentCreate,
     DocumentUpdate,
     JobUpdate,
     PageCreate,
-    get_case_for_user,
     create_case,
     create_document,
+    get_case_for_user,
+    get_document_for_user,
     insert_chunks,
     insert_pages,
     list_cases,
+    update_case,
     update_document,
     update_job,
     write_audit_event,
@@ -202,6 +205,38 @@ def test_create_case_sets_owner_from_authenticated_user() -> None:
     payload = cases.insert.call_args.args[0]
     assert payload["owner_user_id"] == str(user_id)
     assert payload["title"] == "Test case"
+
+
+def test_update_case_updates_owned_case() -> None:
+    user_id = uuid4()
+    case_id = uuid4()
+    original = _case_row(case_id, user_id)
+    updated = _case_row(case_id, user_id, title="Updated case")
+    cases = _table_mock(select=[original], update=[updated])
+    client = _client({"cases": cases})
+
+    result = update_case(
+        client, user_id, case_id, CaseUpdate(title="Updated case")
+    )
+
+    assert result.title == "Updated case"
+    assert cases.update.call_args.args[0] == {"title": "Updated case"}
+
+
+def test_get_document_for_user_returns_owned_document() -> None:
+    user_id = uuid4()
+    case_id = uuid4()
+    document_id = uuid4()
+    cases = _table_mock(select=[_case_row(case_id, user_id)])
+    documents = _table_mock(
+        select=[_document_row(document_id, case_id, user_id)]
+    )
+    client = _client({"cases": cases, "documents": documents})
+
+    result = get_document_for_user(client, user_id, document_id)
+
+    assert result.id == document_id
+    assert result.case_id == case_id
 
 
 def test_create_document_rejects_unowned_case() -> None:
