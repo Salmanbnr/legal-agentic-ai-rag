@@ -56,6 +56,24 @@ def _document_row(
     }
 
 
+def _job_row(job_id: UUID, case_id: UUID, document_id: UUID) -> dict[str, object]:
+    return {
+        "id": str(job_id),
+        "case_id": str(case_id),
+        "document_id": str(document_id),
+        "job_type": "ingest",
+        "idempotency_key": "job-1",
+        "status": "queued",
+        "attempts": 0,
+        "error_code": None,
+        "error_summary": None,
+        "pipeline_version": "v1",
+        "started_at": None,
+        "finished_at": None,
+        "created_at": TIMESTAMP,
+    }
+
+
 def _single_row_client(
     table_name: str, rows: list[dict[str, object]]
 ) -> MagicMock:
@@ -104,6 +122,35 @@ def test_foreign_document_returns_same_404_as_missing_document() -> None:
     assert foreign.value.status_code == 404
     assert missing.value.status_code == 404
     assert foreign.value.detail == missing.value.detail == "Document not found"
+
+
+def test_foreign_job_returns_same_404_as_missing_job() -> None:
+    user = _user()
+    case_id = uuid4()
+    document_id = uuid4()
+    job_id = uuid4()
+    job_table = MagicMock()
+    job_table.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
+        _job_row(job_id, case_id, document_id)
+    ]
+    case_table = MagicMock()
+    case_table.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
+        _case_row(case_id, uuid4())
+    ]
+    foreign_client = MagicMock()
+    foreign_client.table.side_effect = lambda name: (
+        job_table if name == "processing_jobs" else case_table
+    )
+    missing_client = _single_row_client("processing_jobs", [])
+
+    with pytest.raises(HTTPException) as foreign:
+        access.require_job_access(job_id, user, client=foreign_client)
+    with pytest.raises(HTTPException) as missing:
+        access.require_job_access(uuid4(), user, client=missing_client)
+
+    assert foreign.value.status_code == 404
+    assert missing.value.status_code == 404
+    assert foreign.value.detail == missing.value.detail == "Job not found"
 
 
 def test_case_access_maps_domain_denial_to_404(

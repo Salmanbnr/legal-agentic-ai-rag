@@ -1,1 +1,1 @@
-﻿"""Case-scoped evidence retrieval."""
+﻿"""Hybrid dense and lexical evidence retrieval."""

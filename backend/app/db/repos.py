@@ -8,7 +8,7 @@ backend code, even though the service-role client bypasses RLS.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -159,6 +159,7 @@ class ProcessingJob(RowModel):
     pipeline_version: str | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    next_attempt_at: datetime | None = None
     created_at: datetime
 
 
@@ -176,6 +177,20 @@ class AuditEvent(RowModel):
     created_at: datetime
 
 
+class Answer(RowModel):
+    """A stored answer with its evidence manifest."""
+
+    id: UUID
+    case_id: UUID
+    user_id: UUID
+    question: str
+    answer_payload: dict[str, Any] = Field(default_factory=dict)
+    evidence_refs: list[Any] = Field(default_factory=list)
+    graph_version: str | None = None
+    final_status: str | None = None
+    created_at: datetime
+
+
 class DocumentCreate(BaseModel):
     """Fields accepted when registering an uploaded document."""
 
@@ -188,6 +203,9 @@ class DocumentCreate(BaseModel):
     document_type: str | None = None
     version_group_id: UUID | None = None
     duplicate_of: UUID | None = None
+    quality_status: QualityStatus | None = None
+    quality_report: dict[str, Any] | None = None
+    processing_status: ProcessingStatus | None = None
 
 
 class DocumentUpdate(BaseModel):
@@ -243,6 +261,16 @@ class JobCreate(BaseModel):
     pipeline_version: str | None = None
 
 
+class AnswerCreate(BaseModel):
+    """Fields accepted when storing an answer."""
+
+    question: str = Field(min_length=1, max_length=20000)
+    answer_payload: dict[str, Any]
+    evidence_refs: list[Any] = Field(default_factory=list)
+    graph_version: str | None = None
+    final_status: str | None = None
+
+
 class JobUpdate(BaseModel):
     """Mutable job state and sanitized failure metadata."""
 
@@ -253,6 +281,7 @@ class JobUpdate(BaseModel):
     pipeline_version: str | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    next_attempt_at: datetime | None = None
 
 
 def _rows(response: Any) -> list[dict[str, Any]]:
@@ -277,6 +306,13 @@ def _as_text(value: UUID | str) -> str:
         return str(UUID(str(value)))
     except (TypeError, ValueError) as exc:
         raise ValueError("Invalid UUID value") from exc
+
+
+def _validate_sha256(value: str) -> str:
+    """Require a lowercase 64-character SHA-256 digest."""
+    if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+        raise ValueError("Invalid SHA-256 digest")
+    return value
 
 
 def _pagination(limit: int, offset: int) -> tuple[int, int]:
@@ -346,6 +382,37 @@ def _require_job_row(
         raise RecordNotFound("Job not found or access denied")
     _require_case_row(client, user_id, row["case_id"])
     return row
+
+
+def get_job_for_user(
+    client: Client, user_id: UUID | str, job_id: UUID | str
+) -> ProcessingJob:
+    """Return a job only when the user owns the job's case.
+
+    Raises:
+        RecordNotFound: If the job is missing or belongs to another user.
+    """
+    return ProcessingJob.model_validate(_require_job_row(client, user_id, job_id))
+
+
+def find_job_by_idempotency_key(
+    client: Client, user_id: UUID | str, idempotency_key: str
+) -> ProcessingJob | None:
+    """Return an owned job for an idempotency key, if it already exists."""
+    if not idempotency_key:
+        raise ValueError("Idempotency key must not be empty")
+    response = (
+        client.table("processing_jobs")
+        .select("*")
+        .eq("idempotency_key", idempotency_key)
+        .limit(1)
+        .execute()
+    )
+    row = _first_row(response)
+    if row is None:
+        return None
+    _require_case_row(client, user_id, row["case_id"])
+    return ProcessingJob.model_validate(row)
 
 
 def _inserted_row(response: Any, label: str) -> dict[str, Any]:
@@ -470,6 +537,32 @@ def get_document_for_user(
     return Document.model_validate(_require_document_row(client, user_id, document_id))
 
 
+def find_document_by_sha256(
+    client: Client,
+    user_id: UUID | str,
+    case_id: UUID | str,
+    sha256: str,
+) -> Document | None:
+    """Find an active document with the same digest in an owned case."""
+    _require_case_row(client, user_id, case_id)
+    digest = _validate_sha256(sha256)
+    response = (
+        client.table("documents")
+        .select("*")
+        .eq("case_id", _as_text(case_id))
+        .eq("owner_user_id", _as_text(user_id))
+        .eq("sha256", digest)
+        .order("created_at")
+        .limit(20)
+        .execute()
+    )
+    for row in _rows(response):
+        quality_report = row.get("quality_report") or {}
+        if not quality_report.get("deletion_requested"):
+            return Document.model_validate(row)
+    return None
+
+
 def update_document(
     client: Client,
     user_id: UUID | str,
@@ -516,6 +609,49 @@ def list_documents(
     return [Document.model_validate(row) for row in _rows(response)]
 
 
+def get_chunks_by_ids(
+    client: Client,
+    user_id: UUID | str,
+    case_id: UUID | str,
+    chunk_ids: Sequence[UUID | str],
+) -> list[DocumentChunk]:
+    """Return case chunks by id after verifying case ownership."""
+    _require_case_row(client, user_id, case_id)
+    ids = [_as_text(chunk_id) for chunk_id in chunk_ids]
+    if not ids:
+        return []
+    response = (
+        client.table("document_chunks")
+        .select("*")
+        .eq("case_id", _as_text(case_id))
+        .in_("id", ids)
+        .execute()
+    )
+    return [DocumentChunk.model_validate(row) for row in _rows(response)]
+
+
+def get_pages_for_documents(
+    client: Client,
+    user_id: UUID | str,
+    case_id: UUID | str,
+    document_ids: Sequence[UUID | str],
+) -> list[DocumentPage]:
+    """Return the pages of case documents after verifying case ownership."""
+    _require_case_row(client, user_id, case_id)
+    ids = [_as_text(document_id) for document_id in document_ids]
+    if not ids:
+        return []
+    response = (
+        client.table("document_pages")
+        .select("*")
+        .eq("case_id", _as_text(case_id))
+        .in_("document_id", ids)
+        .order("page_number")
+        .execute()
+    )
+    return [DocumentPage.model_validate(row) for row in _rows(response)]
+
+
 def insert_pages(
     client: Client,
     user_id: UUID | str,
@@ -540,6 +676,80 @@ def insert_pages(
     if len(rows) != len(payload):
         raise RepositoryError("Document page insert returned an unexpected row count")
     return [DocumentPage.model_validate(row) for row in rows]
+
+
+def update_page(
+    client: Client,
+    user_id: UUID | str,
+    case_id: UUID | str,
+    document_id: UUID | str,
+    page: PageCreate,
+) -> DocumentPage:
+    """Replace one extracted page after verifying document ownership."""
+    document = _require_document_row(client, user_id, document_id, case_id)
+    payload = page.model_dump(mode="json", exclude_none=False)
+    payload.pop("page_number", None)
+    response = (
+        client.table("document_pages")
+        .update(payload)
+        .eq("document_id", _as_text(document_id))
+        .eq("page_number", page.page_number)
+        .execute()
+    )
+    row = _first_row(response)
+    if row is None:
+        raise RecordNotFound("Document page not found")
+    row_case_id = row.get("case_id")
+    if row_case_id is None or _as_text(row_case_id) != _as_text(document["case_id"]):
+        raise DocumentAccessDenied("Document page not found or access denied")
+    return DocumentPage.model_validate(row)
+
+
+def get_neighbor_chunks(
+    client: Client,
+    user_id: UUID | str,
+    chunk_id: UUID | str,
+    *,
+    before: int = 1,
+    after: int = 1,
+) -> list[DocumentChunk]:
+    """Return a chunk plus nearby chunks from the same document and index.
+
+    The target chunk is resolved from the database first, then its document and
+    case ownership are verified against the authenticated user. Neighbor lookup
+    never crosses a document or an index schema version.
+    """
+    if before < 0 or after < 0:
+        raise ValueError("before and after must be non-negative")
+    response = (
+        client.table("document_chunks")
+        .select("*")
+        .eq("id", _as_text(chunk_id))
+        .limit(1)
+        .execute()
+    )
+    target_row = _first_row(response)
+    if target_row is None:
+        raise RecordNotFound("Chunk not found or access denied")
+    target = DocumentChunk.model_validate(target_row)
+    _require_document_row(
+        client, user_id, target.document_id, target.case_id
+    )
+
+    start = max(0, target.chunk_index - before)
+    end = target.chunk_index + after
+    response = (
+        client.table("document_chunks")
+        .select("*")
+        .eq("document_id", _as_text(target.document_id))
+        .eq("case_id", _as_text(target.case_id))
+        .eq("index_schema_version", target.index_schema_version)
+        .gte("chunk_index", start)
+        .lte("chunk_index", end)
+        .order("chunk_index")
+        .execute()
+    )
+    return [DocumentChunk.model_validate(row) for row in _rows(response)]
 
 
 def insert_chunks(
@@ -636,3 +846,51 @@ def write_audit_event(
     }
     response = client.table("audit_events").insert(payload).execute()
     return AuditEvent.model_validate(_inserted_row(response, "Audit event"))
+
+
+def list_answers(
+    client: Client,
+    user_id: UUID | str,
+    case_id: UUID | str,
+    *,
+    limit: int = 20,
+    offset: int = 0,
+) -> list[Answer]:
+    """List stored answers for a case, newest first, after ownership check."""
+    _require_case_row(client, user_id, case_id)
+    start, end = _pagination(limit, offset)
+    response = (
+        client.table("answers")
+        .select("*")
+        .eq("case_id", _as_text(case_id))
+        .eq("user_id", _as_text(user_id))
+        .order("created_at", desc=True)
+        .range(start, end)
+        .execute()
+    )
+    return [Answer.model_validate(row) for row in _rows(response)]
+
+
+def insert_answer(
+    client: Client,
+    user_id: UUID | str,
+    case_id: UUID | str,
+    data: AnswerCreate,
+) -> Answer:
+    """Store an answer and its evidence manifest after verifying ownership.
+
+    The evidence manifest holds evidence ids and page ranges only. Document
+    text, prompts, and completions stay out of the manifest.
+    """
+    _require_case_row(client, user_id, case_id)
+    payload = {
+        "case_id": _as_text(case_id),
+        "user_id": _as_text(user_id),
+        "question": data.question,
+        "answer_payload": data.answer_payload,
+        "evidence_refs": list(data.evidence_refs),
+        "graph_version": data.graph_version,
+        "final_status": data.final_status,
+    }
+    response = client.table("answers").insert(payload).execute()
+    return Answer.model_validate(_inserted_row(response, "Answer"))

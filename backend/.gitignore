@@ -16,5 +16,6 @@ __pycache__/
 # Runtime data
 .cache/
 .tmp/
+logs/
 .coverage
 htmlcov/

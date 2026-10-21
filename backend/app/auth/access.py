@@ -14,12 +14,16 @@ from app.db.repos import (
     CaseAccessDenied,
     Document,
     DocumentAccessDenied,
+    ProcessingJob,
+    RecordNotFound,
     get_case_for_user,
     get_document_for_user,
+    get_job_for_user,
 )
 
 CASE_NOT_FOUND_MESSAGE = "Case not found"
 DOCUMENT_NOT_FOUND_MESSAGE = "Document not found"
+JOB_NOT_FOUND_MESSAGE = "Job not found"
 
 
 def require_case_access(
@@ -62,4 +66,25 @@ def require_document_access(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=DOCUMENT_NOT_FOUND_MESSAGE,
+        ) from None
+
+
+def require_job_access(
+    job_id: UUID | str,
+    user: CurrentUser,
+    *,
+    client: Client | None = None,
+) -> ProcessingJob:
+    """Return a job only when it belongs to the authenticated user's case.
+
+    Raises:
+        HTTPException: 404 with the same message for missing and foreign jobs.
+    """
+    db = client or get_service_client()
+    try:
+        return get_job_for_user(db, user.id, job_id)
+    except (RecordNotFound, CaseAccessDenied, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=JOB_NOT_FOUND_MESSAGE,
         ) from None
